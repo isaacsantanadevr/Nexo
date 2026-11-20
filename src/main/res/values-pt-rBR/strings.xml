@@ -201,6 +201,7 @@
   <string name="mpris_loop">Repetição</string>
   <string name="mpris_shuffle">Embaralhar</string>
   <string name="mpris_volume">Volume</string>
+  <string name="nexo_lock_notebook">Bloquear notebook</string>
   <string name="mpris_time_settings_title">Botões para avançar/voltar</string>
   <string name="mpris_time_settings_summary">Ajuste o tempo para avançar ou retroceder quando pressionar</string>
   <string-array name="mpris_time_entries">

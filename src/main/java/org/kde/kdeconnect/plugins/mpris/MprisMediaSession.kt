@@ -14,6 +14,7 @@ import android.content.SharedPreferences
 import android.content.SharedPreferences.OnSharedPreferenceChangeListener
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.service.notification.StatusBarNotification
 import android.support.v4.media.MediaMetadataCompat
@@ -31,6 +32,7 @@ import org.kde.kdeconnect.KdeConnect
 import org.kde.kdeconnect.helpers.NotificationHelper
 import org.kde.kdeconnect.plugins.mpris.MprisPlugin.MprisPlayer
 import org.kde.kdeconnect.plugins.notifications.NotificationReceiver
+import org.kde.kdeconnect.plugins.runcommand.RunCommandPlugin
 import org.kde.kdeconnect.plugins.systemvolume.SystemVolumePlugin
 import org.kde.kdeconnect.plugins.systemvolume.SystemVolumeProvider
 import org.kde.kdeconnect.plugins.systemvolume.SystemVolumeProvider.ProviderStateListener
@@ -50,6 +52,7 @@ class MprisMediaSession : OnSharedPreferenceChangeListener, NotificationReceiver
 
     // Holds the player displayed in the notification
     private var currentShowingPlayer: MprisPlayer? = null
+    private var explicitlySelectedPlayer: Pair<String, String>? = null
 
     // Keep the device preference when the notification and current player are cleared
     private var lastShowingDeviceId: String? = null
@@ -65,23 +68,31 @@ class MprisMediaSession : OnSharedPreferenceChangeListener, NotificationReceiver
     // Callback for control via the media session API
     private val mediaSessionCallback: MediaSessionCompat.Callback = object : MediaSessionCompat.Callback() {
         override fun onPlay() {
-            currentShowingPlayer?.sendPlay()
+            currentMediaPlayer()?.sendPlay()
         }
 
         override fun onPause() {
-            currentShowingPlayer?.sendPause()
+            currentMediaPlayer()?.sendPause()
         }
 
         override fun onSkipToNext() {
-            currentShowingPlayer?.sendNext()
+            currentMediaPlayer()?.sendNext()
         }
 
         override fun onSkipToPrevious() {
-            currentShowingPlayer?.sendPrevious()
+            currentMediaPlayer()?.sendPrevious()
         }
 
         override fun onSeekTo(pos: Long) {
-            currentShowingPlayer?.sendSetPosition(pos.toInt())
+            currentMediaPlayer()?.sendSetPosition(pos.toInt())
+        }
+
+        override fun onCustomAction(action: String?, extras: Bundle?) {
+            if (action != ACTION_LOCK_NOTEBOOK) return
+            val device = currentMediaPlayer()?.device ?: return
+            val plugin = device.getPlugin<RunCommandPlugin>() ?: return
+            val command = plugin.commandList.firstOrNull { isLockNotebookCommand(it.name) } ?: return
+            plugin.runCommand(command.key)
         }
     }
 
@@ -153,6 +164,9 @@ class MprisMediaSession : OnSharedPreferenceChangeListener, NotificationReceiver
      * player and device, while possible.
      */
     private fun findPlayer(): MprisPlayer? {
+        explicitlySelectedPlayer?.let { (deviceId, playerName) ->
+            return resolveSelectedPlayer(deviceId, playerName)?.takeIf(::shouldShowPlayer)
+        }
         val currentPlayer = currentShowingPlayer
         val currentDevice = currentPlayer?.device ?: lastShowingDeviceId
             ?.takeIf(mprisDevices::contains)
@@ -186,6 +200,21 @@ class MprisMediaSession : OnSharedPreferenceChangeListener, NotificationReceiver
         }
 
         return null
+    }
+
+    private fun currentMediaPlayer(): MprisPlayer? {
+        val selected = explicitlySelectedPlayer
+        if (selected != null) return resolveSelectedPlayer(selected.first, selected.second)
+        val showing = currentShowingPlayer ?: return null
+        val device = KdeConnect.getInstance().getDevice(showing.device.deviceId) ?: return null
+        return device.getPlugin<MprisPlugin>()?.getPlayerStatus(showing.playerName)
+    }
+
+    private fun resolveSelectedPlayer(deviceId: String, playerName: String): MprisPlayer? {
+        if (deviceId !in mprisDevices) return null
+        val device = KdeConnect.getInstance().getDevice(deviceId) ?: return null
+        val plugin = device.getPlugin<MprisPlugin>() ?: return null
+        return MprisPlayerSelection.findExactPlayer(plugin, playerName)
     }
 
     private fun getPlayerFromDevice(device: Device, preferredPlayer: MprisPlayer?): MprisPlayer? {
@@ -263,11 +292,12 @@ class MprisMediaSession : OnSharedPreferenceChangeListener, NotificationReceiver
         }
 
         val playbackState = PlaybackStateCompat.Builder()
+        val mediaPosition = if (player.positionKnown) player.position else PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN
 
         if (player.isPlaying) {
-            playbackState.setState(PlaybackStateCompat.STATE_PLAYING, player.position, 1.0f)
+            playbackState.setState(PlaybackStateCompat.STATE_PLAYING, mediaPosition, 1.0f)
         } else {
-            playbackState.setState(PlaybackStateCompat.STATE_PAUSED, player.position, 0.0f)
+            playbackState.setState(PlaybackStateCompat.STATE_PAUSED, mediaPosition, 0.0f)
         }
 
         // Create all actions (previous/play/pause/next)
@@ -330,6 +360,18 @@ class MprisMediaSession : OnSharedPreferenceChangeListener, NotificationReceiver
         val aNext = NotificationCompat.Action.Builder(
             R.drawable.ic_next_white, context.getString(R.string.mpris_next), piNext
         )
+        val lockCommand = device.getPlugin<RunCommandPlugin>()?.commandList?.firstOrNull { isLockNotebookCommand(it.name) }
+        val lockAction = lockCommand?.let { command ->
+            val intent = Intent(context, MprisMediaNotificationReceiver::class.java).apply {
+                action = MprisMediaNotificationReceiver.ACTION_LOCK_NOTEBOOK
+                putExtra(MprisMediaNotificationReceiver.EXTRA_DEVICE_ID, deviceId)
+                putExtra(MprisMediaNotificationReceiver.EXTRA_COMMAND_KEY, command.key)
+            }
+            val pendingIntent = PendingIntent.getBroadcast(
+                context, 4, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            NotificationCompat.Action.Builder(R.drawable.nexo_lock_24, context.getString(R.string.nexo_lock_notebook), pendingIntent).build()
+        }
 
         val iOpenActivity = Intent(context, MprisActivity::class.java).apply {
             putExtra(MprisActivity.EXTRA_DEVICE_ID, deviceId)
@@ -404,6 +446,13 @@ class MprisMediaSession : OnSharedPreferenceChangeListener, NotificationReceiver
             playbackActions = playbackActions or PlaybackStateCompat.ACTION_SKIP_TO_NEXT
             ++numActions
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && lockCommand != null) {
+            playbackState.addCustomAction(ACTION_LOCK_NOTEBOOK, context.getString(R.string.nexo_lock_notebook), R.drawable.nexo_lock_24)
+        }
+        val lockActionIndex = lockAction?.takeIf { Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU }?.let {
+            notification.addAction(it)
+            numActions
+        }
         // Documentation says that this was added in Lollipop (21) but it seems to cause crashes on < Pie (28)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             if (player.isSeekAllowed) {
@@ -417,7 +466,14 @@ class MprisMediaSession : OnSharedPreferenceChangeListener, NotificationReceiver
 
         // Use the MediaStyle notification, so it feels like other media players. That also allows adding actions
         val mediaStyle = androidx.media.app.NotificationCompat.MediaStyle()
-        if (numActions == 1) {
+        if (lockActionIndex != null) {
+            val compact = mutableListOf<Int>()
+            if (player.isGoPreviousAllowed) compact.add(0)
+            val centerIndex = if (player.isGoPreviousAllowed) 1 else 0
+            if (player.isPlaying && player.isPauseAllowed || !player.isPlaying && player.isPlayAllowed) compact.add(centerIndex)
+            if (compact.size < 3) compact.add(lockActionIndex)
+            if (compact.isNotEmpty()) mediaStyle.setShowActionsInCompactView(*compact.toIntArray())
+        } else if (numActions == 1) {
             mediaStyle.setShowActionsInCompactView(0)
         } else if (numActions == 2) {
             mediaStyle.setShowActionsInCompactView(0, 1)
@@ -472,8 +528,15 @@ class MprisMediaSession : OnSharedPreferenceChangeListener, NotificationReceiver
     }
 
     fun playerSelected(player: MprisPlayer?) {
+        explicitlySelectedPlayer = player?.let { it.device.deviceId to it.playerName }
         currentShowingPlayer = player
         updateMediaNotification()
+    }
+
+    private fun isLockNotebookCommand(name: String): Boolean {
+        val normalized = java.text.Normalizer.normalize(name, java.text.Normalizer.Form.NFD)
+            .replace(Regex("\\p{Mn}+"), "").trim().lowercase(java.util.Locale.ROOT)
+        return normalized in setOf("bloquear", "bloquear sessao", "lock", "lock session")
     }
 
     override fun onNotificationPosted(n: StatusBarNotification) {
@@ -515,6 +578,7 @@ class MprisMediaSession : OnSharedPreferenceChangeListener, NotificationReceiver
         this.packageName == SPOTIFY_PACKAGE_NAME
 
     companion object {
+        const val ACTION_LOCK_NOTEBOOK = "org.kde.kdeconnect.nexo.LOCK_NOTEBOOK"
         private const val TAG = "MprisMediaSession"
 
         private const val MPRIS_MEDIA_NOTIFICATION_ID =

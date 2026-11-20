@@ -76,11 +76,13 @@ class MprisPlugin : Plugin() {
             internal set
         var isShuffleAllowed: Boolean = false
             internal set
-        var volume: Int = 50
+        var volume: Int = -1
             internal set
         var length: Long = -1
             internal set
         var lastPosition: Long = 0
+            internal set
+        var positionKnown: Boolean = false
             internal set
         var lastPositionTime: Long
             internal set
@@ -124,7 +126,7 @@ class MprisPlugin : Plugin() {
         }
 
         val isSetVolumeAllowed: Boolean
-            get() = volume > -1
+            get() = volume in 0..100
 
         var playbackRate: Double = 1.0
             internal set
@@ -305,11 +307,15 @@ class MprisPlugin : Plugin() {
                     playerStatus.shuffle = np.getBoolean("shuffle", playerStatus.shuffle)
                     playerStatus.isShuffleAllowed = true
                 }
-                playerStatus.volume = np.getInt("volume", playerStatus.volume)
+                if (np.has("volume")) {
+                    val reportedVolume = np.getInt("volume", -1)
+                    playerStatus.volume = reportedVolume.takeIf { it in 0..100 } ?: -1
+                }
                 playerStatus.length = np.getLong("length", playerStatus.length)
                 if (np.has("pos")) {
                     playerStatus.lastPosition = np.getLong("pos", playerStatus.lastPosition)
                     playerStatus.lastPositionTime = SystemClock.elapsedRealtime()
+                    playerStatus.positionKnown = true
                 }
                 if (np.has("rate")) {
                     playerStatus.playbackRate = np.getDouble("rate", playerStatus.playbackRate)

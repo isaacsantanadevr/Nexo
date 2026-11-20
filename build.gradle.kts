@@ -38,11 +38,11 @@ android {
     namespace = "org.kde.kdeconnect_tp"
     compileSdk = 37
     defaultConfig {
-        applicationId = "org.kde.kdeconnect_tp"
+        applicationId = "br.com.nexo"
         minSdk = 23
         targetSdk = 37
-        versionCode = 13703
-        versionName = "1.37.3"
+        versionCode = 13705
+        versionName = "0.3"
         proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
     }
     buildFeatures {
@@ -86,7 +86,6 @@ android {
             isShrinkResources = false
             signingConfig = signingConfigs.getByName("debug")
             applicationIdSuffix = ".debug"
-            versionNameSuffix = "-debug"
         }
         getByName("release") {
             isMinifyEnabled = true

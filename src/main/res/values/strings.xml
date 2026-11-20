@@ -272,6 +272,7 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
     <string name="mpris_loop">Loop</string>
     <string name="mpris_shuffle">Shuffle</string>
     <string name="mpris_volume">Volume</string>
+    <string name="nexo_lock_notebook">Lock notebook</string>
     <string name="mpris_time_settings_title">Forward/rewind buttons</string>
     <string name="mpris_time_settings_summary">Adjust the time to fast forward/rewind when pressed</string>
     <string name="mpris_time_key" translatable="false">mpris_interval_time</string>

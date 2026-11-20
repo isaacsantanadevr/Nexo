@@ -11,12 +11,27 @@ import android.content.Intent
 import android.util.Log
 import org.kde.kdeconnect.KdeConnect
 import org.kde.kdeconnect.extensions.getParcelableExtraCompat
+import org.kde.kdeconnect.plugins.runcommand.RunCommandPlugin
+import java.text.Normalizer
+import java.util.Locale
 
 /**
  * Called when the mpris media notification's buttons are pressed
  */
 class MprisMediaNotificationReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == ACTION_LOCK_NOTEBOOK) {
+            val deviceId = intent.getStringExtra(EXTRA_DEVICE_ID) ?: return
+            val key = intent.getStringExtra(EXTRA_COMMAND_KEY) ?: return
+            val plugin = KdeConnect.getInstance().getDevicePlugin<RunCommandPlugin>(deviceId) ?: return
+            val command = plugin.commandList.firstOrNull { it.key == key } ?: return
+            val normalized = Normalizer.normalize(command.name, Normalizer.Form.NFD)
+                .replace(Regex("\\p{Mn}+"), "").trim().lowercase(Locale.ROOT)
+            if (normalized in setOf("bloquear", "bloquear sessao", "lock", "lock session")) {
+                plugin.runCommand(command.key)
+            }
+            return
+        }
         // First case: buttons send by other applications via the media session APIs. They don't target a specific device.
         if (Intent.ACTION_MEDIA_BUTTON == intent.action) {
             // Route these buttons to the media session, which will handle them
@@ -50,8 +65,10 @@ class MprisMediaNotificationReceiver : BroadcastReceiver() {
         const val ACTION_PREVIOUS: String = "ACTION_PREVIOUS"
         const val ACTION_NEXT: String = "ACTION_NEXT"
         const val ACTION_CLOSE_NOTIFICATION: String = "ACTION_CLOSE_NOTIFICATION"
+        const val ACTION_LOCK_NOTEBOOK: String = "ACTION_LOCK_NOTEBOOK"
 
         const val EXTRA_DEVICE_ID: String = "deviceId"
         const val EXTRA_MPRIS_PLAYER: String = "player"
+        const val EXTRA_COMMAND_KEY: String = "commandKey"
     }
 }

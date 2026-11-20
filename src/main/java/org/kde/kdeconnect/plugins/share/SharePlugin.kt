@@ -11,6 +11,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.provider.OpenableColumns
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -34,6 +35,7 @@ import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
 import org.kde.kdeconnect.ui.MainActivity
 import org.kde.kdeconnect.ui.PluginSettingsFragment
 import org.kde.kdeconnect_tp.R
+import java.util.UUID
 
 /**
  * A Plugin for sharing and receiving files and uris.
@@ -234,7 +236,20 @@ class SharePlugin : Plugin() {
 
     fun sendFiles(uriList: List<Uri>, onComplete: (() -> Unit)? = null) {
         //Read all the data early, as we only have permissions to do it while the activity is alive
-        val packets = uriList.mapNotNull { uriToNetworkPacket(context, it, PACKET_TYPE_SHARE_REQUEST) }
+        val packets = uriList.mapNotNull { uri ->
+            val packet = uriToNetworkPacket(context, uri, PACKET_TYPE_SHARE_REQUEST)
+            if (packet == null) {
+                val name = runCatching {
+                    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    }
+                }.getOrNull() ?: uri.lastPathSegment ?: "Arquivo"
+                org.kde.kdeconnect.nexo.NexoStore.transfer(
+                    device, UUID.randomUUID().toString(), name, "Enviado", 0, "Falhou", false
+                )
+            }
+            packet
+        }
 
         try {
             if (packets.isEmpty()) {

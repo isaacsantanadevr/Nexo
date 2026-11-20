@@ -28,6 +28,8 @@ import java.io.OutputStream
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.nio.file.attribute.FileTime
+import java.util.IdentityHashMap
+import java.util.UUID
 
 /**
  * A [ShareJob] that reads Files from another device.
@@ -49,6 +51,11 @@ class CompositeReceiveFileJob(device: Device, onFinished: (ShareJob) -> Unit)
     private val receiveNotification: ReceiveNotification = ReceiveNotification(device, id)
     private var currentNetworkPacket: NetworkPacket? = null
     private var currentFileName: String? = null
+    @Volatile private var currentNexoId: String = ""
+    private var currentFileReceived: Long = 0
+    private var currentFileProgress: Int = 0
+    private var currentFileProgressKnown: Boolean = false
+    private var currentFileComplete: Boolean = false
     private var currentFileNum: Int = 0
     private var totalReceived: Long = 0
     private var lastProgressTimeMillis: Long = 0
@@ -58,6 +65,9 @@ class CompositeReceiveFileJob(device: Device, onFinished: (ShareJob) -> Unit)
 
     @GuardedBy("lock")
     private val networkPacketList = mutableListOf<NetworkPacket>()
+
+    @GuardedBy("lock")
+    private val transferIds = IdentityHashMap<NetworkPacket, String>()
 
     @GuardedBy("lock")
     private var totalNumFiles: Int = 0
@@ -108,6 +118,11 @@ class CompositeReceiveFileJob(device: Device, onFinished: (ShareJob) -> Unit)
 
             if (!networkPacketList.contains(networkPacket)) {
                 networkPacketList.add(networkPacket)
+                val transferId = UUID.randomUUID().toString()
+                transferIds[networkPacket] = transferId
+                org.kde.kdeconnect.nexo.NexoStore.transfer(
+                    device, transferId, networkPacket.getString("filename", "Arquivo"), "Recebido", 0, "Preparando", false
+                )
 
                 totalNumFiles = networkPacket.getInt(SharePlugin.KEY_NUMBER_OF_FILES, 1)
                 totalPayloadSize = networkPacket.getLong(SharePlugin.KEY_TOTAL_PAYLOAD_SIZE)
@@ -140,20 +155,28 @@ class CompositeReceiveFileJob(device: Device, onFinished: (ShareJob) -> Unit)
                         finished = true
                     } else {
                         currentNetworkPacket = next
+                        currentNexoId = transferIds[next] ?: UUID.randomUUID().toString()
                     }
                     next
                 } ?: break
 
                 val filename = packet.getString("filename", System.currentTimeMillis().toString())
                 currentFileName = filename
+                currentFileReceived = 0
+                currentFileProgress = 0
+                currentFileProgressKnown = false
+                currentFileComplete = false
                 currentFileNum++
 
-                setProgress(prevProgressPercentage)
+                nexoTransfer(0, "Recebendo", false)
+                setProgress(prevProgressPercentage, 0, false)
 
                 fileDocument = getDocumentFileFor(filename, packet.getBoolean("open", false))
                 val size = receivePacket(fileDocument, packet)
                 publishFile(fileDocument, size)
                 numFilesReceived++
+                currentFileComplete = true
+                nexoTransfer(currentFileProgress, "Sucesso reportado pelo KDE Connect", currentFileProgressKnown, fileDocument.uri.toString())
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     if (packet.has("lastModified")) {
@@ -196,6 +219,8 @@ class CompositeReceiveFileJob(device: Device, onFinished: (ShareJob) -> Unit)
             isRunning = false
 
             if (isCancelled) {
+                if (currentNexoId.isNotEmpty() && !currentFileComplete) nexoTransfer(currentFileProgress, "Cancelado", currentFileProgressKnown)
+                markQueuedInterrupted(cancelFirst = currentNexoId.isEmpty())
                 receiveNotification.cancel()
                 return
             }
@@ -221,6 +246,9 @@ class CompositeReceiveFileJob(device: Device, onFinished: (ShareJob) -> Unit)
             receiveNotification.setFinished(device.context.getString(R.string.no_app_for_opening))
             receiveNotification.show()
         } catch (e: Exception) {
+            val status = when { isCancelled -> "Cancelado"; !device.isReachable -> "Interrompido"; else -> "Falhou" }
+            if (currentNexoId.isNotEmpty() && !currentFileComplete) nexoTransfer(currentFileProgress, status, currentFileProgressKnown)
+            markQueuedInterrupted(cancelFirst = isCancelled && currentNexoId.isEmpty())
             isRunning = false
             if (isCancelled) {
                 Log.d("SharePlugin", "Cancelled receiving file $currentFileName", e)
@@ -307,6 +335,7 @@ class CompositeReceiveFileJob(device: Device, onFinished: (ShareJob) -> Unit)
 
         while (input.read(data).also { count = it } >= 0 && !isCancelled) {
             received += count.toLong()
+            currentFileReceived += count.toLong()
             totalReceived += count.toLong()
 
             output.write(data, 0, count)
@@ -314,14 +343,17 @@ class CompositeReceiveFileJob(device: Device, onFinished: (ShareJob) -> Unit)
             val progressPercentage = synchronized(lock) {
                 if (totalPayloadSize > 0) (totalReceived * 100 / totalPayloadSize).coerceIn(0L, 100L) else 0L
             }.toInt()
+            val filePayloadSize = currentNetworkPacket?.payloadSize ?: -1L
+            val fileProgress = if (filePayloadSize > 0) (currentFileReceived * 100 / filePayloadSize).coerceIn(0L, 100L).toInt() else 0
+            val fileProgressChanged = filePayloadSize > 0 && fileProgress != currentFileProgress
             val curTimeMillis = SystemClock.elapsedRealtime()
 
-            if (progressPercentage != prevProgressPercentage &&
-                (progressPercentage == 100 || curTimeMillis - lastProgressTimeMillis >= 500)
+            if ((progressPercentage != prevProgressPercentage || fileProgressChanged) &&
+                (fileProgress == 100 || curTimeMillis - lastProgressTimeMillis >= 500)
             ) {
                 prevProgressPercentage = progressPercentage
                 lastProgressTimeMillis = curTimeMillis
-                setProgress(progressPercentage)
+                setProgress(progressPercentage, fileProgress, filePayloadSize > 0)
             }
         }
 
@@ -333,11 +365,32 @@ class CompositeReceiveFileJob(device: Device, onFinished: (ShareJob) -> Unit)
     private fun showNewTotalsIfRunning() {
         // If we are already receiving a file, update the notification right away to show the new number of files
         if (isRunning && currentFileNum > 0) {
-            setProgress(prevProgressPercentage)
+            setProgress(prevProgressPercentage, currentFileProgress, currentFileProgressKnown)
         }
     }
 
-    private fun setProgress(progress: Int) {
+    private fun nexoTransfer(progress: Int, status: String, progressKnown: Boolean? = null, fileUri: String? = null) {
+        if (currentNexoId.isNotEmpty()) org.kde.kdeconnect.nexo.NexoStore.transfer(
+            device, currentNexoId, currentFileName ?: "Arquivo", "Recebido", progress, status, progressKnown, fileUri
+        )
+    }
+
+    private fun markQueuedInterrupted(cancelFirst: Boolean = false) {
+        synchronized(lock) {
+            for ((index, packet) in networkPacketList.withIndex()) {
+                val transferId = transferIds[packet] ?: continue
+                org.kde.kdeconnect.nexo.NexoStore.transfer(
+                    device, transferId, packet.getString("filename", "Arquivo"), "Recebido", 0,
+                    if (cancelFirst && index == 0) "Cancelado" else "Interrompido", false
+                )
+            }
+        }
+    }
+
+    private fun setProgress(progress: Int, fileProgress: Int, progressKnown: Boolean) {
+        currentFileProgress = fileProgress
+        currentFileProgressKnown = progressKnown
+        nexoTransfer(fileProgress, "Recebendo", progressKnown)
         synchronized(lock) {
             receiveNotification.setProgress(
                 progress,
@@ -372,7 +425,7 @@ class CompositeReceiveFileJob(device: Device, onFinished: (ShareJob) -> Unit)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             // Nougat and later require "content://" uris instead of "file://" uris
             val file = File(fileDocument.uri.path ?: "")
-            val contentUri = FileProvider.getUriForFile(device.context, "org.kde.kdeconnect_tp.fileprovider", file)
+            val contentUri = FileProvider.getUriForFile(device.context, org.kde.kdeconnect_tp.BuildConfig.APPLICATION_ID + ".fileprovider", file)
             intent.setDataAndType(contentUri, mimeType)
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
         } else {

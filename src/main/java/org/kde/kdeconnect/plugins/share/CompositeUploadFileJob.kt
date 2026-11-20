@@ -14,6 +14,8 @@ import org.kde.kdeconnect.NetworkPacket
 import org.kde.kdeconnect.plugins.share.SharePlugin.Companion.KEY_NUMBER_OF_FILES
 import org.kde.kdeconnect.plugins.share.SharePlugin.Companion.KEY_TOTAL_PAYLOAD_SIZE
 import org.kde.kdeconnect_tp.R
+import java.util.IdentityHashMap
+import java.util.UUID
 
 /**
  * A [ShareJob] that sends Files to another device.
@@ -39,6 +41,10 @@ class CompositeUploadFileJob(device: Device, onFinished: (ShareJob) -> Unit)
     private val handler: Handler = Handler(Looper.getMainLooper())
     private var currentFileName: String = ""
     private var currentFileNum: Int = 0
+    @Volatile private var currentNexoId: String = ""
+    @Volatile private var currentFileProgress: Int = 0
+    @Volatile private var currentFileProgressKnown: Boolean = false
+    @Volatile private var currentFileComplete: Boolean = false
     private var updatePacketPending: Boolean = false
     private var totalSend: Long = 0
     private var prevProgressPercentage: Int = 0
@@ -48,6 +54,9 @@ class CompositeUploadFileJob(device: Device, onFinished: (ShareJob) -> Unit)
 
     @GuardedBy("lock")
     private val networkPacketList = mutableListOf<NetworkPacket>()
+
+    @GuardedBy("lock")
+    private val transferIds = IdentityHashMap<NetworkPacket, String>()
 
     private var currentNetworkPacket: NetworkPacket? = null
     private val sendPacketStatusCallback: SendPacketStatusCallback = SendPacketStatusCallback()
@@ -74,12 +83,17 @@ class CompositeUploadFileJob(device: Device, onFinished: (ShareJob) -> Unit)
                         break
                     }
                     currentNetworkPacket = next
+                    currentNexoId = transferIds[next] ?: UUID.randomUUID().toString()
+                    currentFileProgress = 0
+                    currentFileProgressKnown = false
+                    currentFileComplete = false
                     next
                 }
 
-                currentFileName = packet.getString("filename")
+                currentFileName = packet.getString("filename", "Arquivo")
                 currentFileNum++
 
+                nexoTransfer(currentFileProgress, "Enviando", false)
                 setProgress(prevProgressPercentage)
 
                 addTotalsToNetworkPacket(packet)
@@ -89,9 +103,13 @@ class CompositeUploadFileJob(device: Device, onFinished: (ShareJob) -> Unit)
                 if (!device.sendPacketBlocking(packet, sendPacketStatusCallback, true)) {
                     throw RuntimeException("Sending packet failed")
                 }
+                currentFileComplete = true
+                nexoTransfer(currentFileProgress, "Sucesso reportado pelo KDE Connect", currentFileProgressKnown)
             }
 
             if (isCancelled) {
+                if (currentNexoId.isNotEmpty() && !currentFileComplete) nexoTransfer(currentFileProgress, "Cancelado", currentFileProgressKnown)
+                markQueuedInterrupted(cancelFirst = currentNexoId.isEmpty())
                 uploadNotification.cancel()
             } else {
                 uploadNotification.setFinished(
@@ -105,20 +123,24 @@ class CompositeUploadFileJob(device: Device, onFinished: (ShareJob) -> Unit)
                 uploadNotification.show()
             }
         } catch (e: RuntimeException) {
-            synchronized(lock) {
-                val failedFiles = totalNumFiles - currentFileNum + 1
-                uploadNotification.setFailed(
-                    device.context.resources.getQuantityString(
-                        R.plurals.send_files_fail_title,
-                        failedFiles,
-                        device.name,
-                        failedFiles,
-                        totalNumFiles,
-                    ),
-                )
+            val status = when { isCancelled -> "Cancelado"; !device.isReachable -> "Interrompido"; else -> "Falhou" }
+            if (currentNexoId.isNotEmpty() && !currentFileComplete) nexoTransfer(currentFileProgress, status, currentFileProgressKnown)
+            markQueuedInterrupted(cancelFirst = isCancelled && currentNexoId.isEmpty())
+            if (isCancelled) uploadNotification.cancel() else {
+                synchronized(lock) {
+                    val failedFiles = totalNumFiles - currentFileNum + 1
+                    uploadNotification.setFailed(
+                        device.context.resources.getQuantityString(
+                            R.plurals.send_files_fail_title,
+                            failedFiles,
+                            device.name,
+                            failedFiles,
+                            totalNumFiles,
+                        ),
+                    )
+                }
+                uploadNotification.show()
             }
-
-            uploadNotification.show()
         } finally {
             isRunning = false
 
@@ -136,6 +158,24 @@ class CompositeUploadFileJob(device: Device, onFinished: (ShareJob) -> Unit)
         synchronized(lock) {
             networkPacket[KEY_NUMBER_OF_FILES] = totalNumFiles
             networkPacket[KEY_TOTAL_PAYLOAD_SIZE] = totalPayloadSize
+        }
+    }
+
+    private fun nexoTransfer(progress: Int, status: String, progressKnown: Boolean? = null) {
+        if (currentNexoId.isNotEmpty()) org.kde.kdeconnect.nexo.NexoStore.transfer(
+            device, currentNexoId, currentFileName, "Enviado", progress, status, progressKnown
+        )
+    }
+
+    private fun markQueuedInterrupted(cancelFirst: Boolean = false) {
+        synchronized(lock) {
+            for ((index, packet) in networkPacketList.withIndex()) {
+                val transferId = transferIds[packet] ?: continue
+                org.kde.kdeconnect.nexo.NexoStore.transfer(
+                    device, transferId, packet.getString("filename", "Arquivo"), "Enviado", 0,
+                    if (cancelFirst && index == 0) "Cancelado" else "Interrompido", false
+                )
+            }
         }
     }
 
@@ -169,6 +209,11 @@ class CompositeUploadFileJob(device: Device, onFinished: (ShareJob) -> Unit)
 
             for (networkPacket in networkPackets) {
                 networkPacketList.add(networkPacket)
+                val transferId = UUID.randomUUID().toString()
+                transferIds[networkPacket] = transferId
+                org.kde.kdeconnect.nexo.NexoStore.transfer(
+                    device, transferId, networkPacket.getString("filename", "Arquivo"), "Enviado", 0, "Preparando", false
+                )
 
                 totalNumFiles++
 
@@ -224,8 +269,12 @@ class CompositeUploadFileJob(device: Device, onFinished: (ShareJob) -> Unit)
     private inner class SendPacketStatusCallback : Device.SendPacketStatusCallback() {
         override fun onPayloadProgressChanged(percent: Int) {
             val payloadSize = currentNetworkPacket?.payloadSize ?: return
-            val send = totalSend + (payloadSize * (percent / 100f))
-            val progress = ((send * 100) / totalPayloadSize).toInt()
+            val progress = if (totalPayloadSize > 0) {
+                ((totalSend.toDouble() + payloadSize.toDouble() * percent.coerceIn(0, 100) / 100.0) * 100.0 / totalPayloadSize).toInt().coerceIn(0, 100)
+            } else percent.coerceIn(0, 100)
+            currentFileProgress = percent.coerceIn(0, 100)
+            currentFileProgressKnown = true
+            nexoTransfer(currentFileProgress, "Enviando", true)
 
             if (progress != prevProgressPercentage) {
                 setProgress(progress)
