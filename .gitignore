@@ -1,0 +1,38 @@
+.attach_pid*
+local.properties
+/.gradle/
+/.idea/
+/.vscode/
+/.fleet/
+/out/
+/gen/
+/bin/
+/build/
+/target/
+/classes/
+# IDE files
+*.iml
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+secrets.properties
+keystore.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.mobileprovision
+# The upstream-tracked debug.keystore remains tracked; this rule ignores new keystores.
+.directory
+GPUCache/
+/release/
+/.kotlin/
